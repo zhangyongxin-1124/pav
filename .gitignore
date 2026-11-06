@@ -1,0 +1,8 @@
+# pav 工具运行状态（含沙箱备份，勿在真实项目中随意删除）
+.pav/
+
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+Thumbs.db

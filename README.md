@@ -92,7 +92,7 @@ python scripts/pav.py selftest
 | 质量分历史 | `.pav/history.json` | 每轮得分（0–100 = 100 − 红线×15 − 阻断×8 − 提醒×3 − 信息×1），连续 2 轮无改进自动收敛 |
 | 修复日志 | `.pav/fix-log.json` | 每次修改的时间/文件/摘要/沙箱备份路径 |
 | 待审批补丁 | `.pav/patches/` | L1 级问题的 unified diff，人工审批后应用 |
-| 六阶段明细 | `.pav/sense|diagnose|evaluate|plan.json` | 每个阶段的机器可读状态 |
+| 六阶段明细 | `.pav/sense.json`、`diagnose.json`、`evaluate.json`、`plan.json` | 每个阶段的机器可读状态 |
 
 ### 检测覆盖（28+ 项，持续增加）
 

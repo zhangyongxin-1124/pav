@@ -32,9 +32,14 @@ import shutil
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 PSEUDO_EXT = (".js", ".ts", ".wxml", ".wxss", ".json", ".html", ".css", ".py", ".vue")
-SKIP_DIRS = {".pav", "node_modules", "miniprogram_npm", ".git", "dist", "unpackage", "__pycache__", ".idea", ".vscode"}
+SKIP_DIRS = {".pav", "node_modules", "miniprogram_npm", ".git", "dist", "unpackage", "__pycache__", ".idea", ".vscode", "__MACOSX"}
+# 临时/锁/备份文件不参与校验（v1.1.1：PowerShell 重定向、Office 锁文件、编辑器备份常带 BOM 或半成品内容，
+# 扫描它们会产出假红线；这类文件不是产品代码，不应计入质量判定）
+SKIP_FILE_PREFIX = ("~$", ".~", "#")
+SKIP_FILE_SUFFIX = (".tmp", ".temp", ".bak", ".orig", ".swp", ".swo", ".crdownload", ".partial")
+SKIP_FILE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
 SEV_CN = {"red": "红线", "amber": "阻断", "yellow": "提醒", "info": "信息"}
 LEVEL_CN = {"L0": "自动执行（沙箱备份+事后评审）", "L1": "生成补丁待审批", "L2": "只出方案人工改", "L3": "禁止自动"}
 MAX_FIX_ATTEMPTS = 3
@@ -77,7 +82,8 @@ def pav_dir(project):
 
 def load_json(path, default=None):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig 可同时兼容「有 BOM」与「无 BOM」两种文件
+        with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except Exception:
         return default
@@ -89,22 +95,46 @@ def save_json(path, data):
 
 
 def read_text(path):
-    """带编码兜底读取。返回 (text, encoding_used) 或 (None, None)。"""
-    for enc in ("utf-8", "utf-8-sig", "gbk"):
+    """带编码兜底读取。返回 (text, encoding_used) 或 (None, None)。
+
+    v1.1.1 修复：编码尝试顺序必须先 utf-8-sig。
+    旧实现先试 utf-8 —— 带 BOM 的文件用 utf-8 也能「成功」解码（BOM 变成 \ufeff 留在字符串里），
+    永远不会轮到 utf-8-sig，导致 json.loads 抛出 "Unexpected UTF-8 BOM"，产出假红线 PAV-F-001。
+    """
+    for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
         try:
             with open(path, "r", encoding=enc) as f:
-                return f.read(), enc
+                text = f.read()
         except UnicodeDecodeError:
             continue
         except OSError:
             return None, None
+        # 双保险：任何残留 BOM 一律剥除，避免下游 JSON/正则误判
+        if text.startswith("\ufeff"):
+            text = text.lstrip("\ufeff")
+            enc = "utf-8-sig"
+        return text, enc
     return None, None
+
+
+def is_junk_file(name):
+    """临时/锁/备份文件判定（v1.1.1：假红线主要来源）。"""
+    low = name.lower()
+    if low in SKIP_FILE_NAMES:
+        return True
+    if name.startswith(SKIP_FILE_PREFIX):
+        return True
+    if low.endswith(SKIP_FILE_SUFFIX):
+        return True
+    return False
 
 
 def walk_files(project, exts=PSEUDO_EXT):
     for root, dirs, files in os.walk(project):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for name in files:
+            if is_junk_file(name):
+                continue
             if name.lower().endswith(exts):
                 full = os.path.join(root, name)
                 rel = os.path.relpath(full, project).replace("\\", "/")
@@ -123,6 +153,15 @@ def load_project(project):
             try:
                 ctx["jsons"][rel] = json.loads(text)
             except Exception as e:
+                # 双保险：解析失败且文本以 BOM 开头 → 剥除后重试一次（不报假红线）
+                retry = text.lstrip("\ufeff")
+                if retry != text:
+                    try:
+                        ctx["jsons"][rel] = json.loads(retry)
+                        ctx["files"][rel] = retry
+                        continue
+                    except Exception as e2:
+                        e = e2
                 ctx["jsons"][rel] = None
                 ctx["errors"].append({"file": rel, "error": str(e)})
     return ctx
@@ -157,7 +196,11 @@ def issue_key(i):
 
 def scan_json_syntax(ctx):
     out = []
-    for rel, err in ctx["errors"]:
+    for item in ctx["errors"]:
+        # ctx["errors"] 里存的是 {"file":..., "error":...} 字典；
+        # 直接 for rel, err in ... 会遍历出键名 "file"/"error"（v1.1.1 修复）
+        rel = item.get("file", "?") if isinstance(item, dict) else str(item)
+        err = item.get("error", "") if isinstance(item, dict) else ""
         out.append(issue("PAV-F-001", "red", "L1", rel, 0,
                          "JSON 解析失败（语法错误），页面/配置可能整体失效",
                          err, "修正 JSON 语法（常见：尾逗号、单引号、注释）"))
@@ -296,7 +339,7 @@ def scan_insecure_http(ctx):
 
 
 def scan_localhost_hardcode(ctx):
-    """本地地址硬编码：本地测试通过≠线上可用，上线后必炸。"""
+    """PIT-0020：本地地址硬编码，上线后必炸。"""
     out = []
     pat = re.compile(r"""['"`](https?://(?:localhost|127\.0\.0\.1)[^'"`\s]*)['"`]""")
     for rel, text in ctx["files"].items():
@@ -305,7 +348,7 @@ def scan_localhost_hardcode(ctx):
         for m in pat.finditer(text):
             line = text[:m.start()].count("\n") + 1
             out.append(issue("PAV-U-001", "red", "L1", rel, line,
-                             "硬编码本地地址（本地测试通过≠线上可用）",
+                             "硬编码本地地址（本地测试通过≠线上可用，历史坑 PIT-0020）",
                              m.group(1), "提取为环境配置/全局 BASE_URL", fix="patch"))
     return out
 
@@ -1227,7 +1270,7 @@ def write_optimize_report(project, history):
            "- 全程仅执行 L0/中风险白名单修复（均沙箱备份可回滚），L2 重构只出方案，L3 断言类未触碰。",
            "- 「绿了」≠「对了」：每轮回归均做证据匹配，可疑项已在上表列明。",
            "- 同一问题尝试上限 %d 次，超限见 .pav/交接报告.md。" % MAX_FIX_ATTEMPTS,
-           "- UI 手测盲区（交互流程/真机表现）请配合人工点检清单。", ""]
+           "- UI 手测盲区（交互流程/真机表现）请配合人工点检或 v2p gate redteam。", ""]
     out = os.path.join(pav_dir(project), "十轮优化报告.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(md))
@@ -1273,6 +1316,17 @@ def cmd_selftest(args):
         f.write('<view bindtap="goHome">go</view>\n<image src="/img/missing.png" />\n<image src="" />')
     with open(os.path.join(tmp, "pages", "index", "index.json"), "w", encoding="utf-8") as f:
         f.write('{"usingComponents": {"ghost-comp": "/components/ghostcomp/ghostcomp"}}')
+    # v1.1.1 回归 fixture：带 BOM 的合法 JSON（不得报假红线）
+    with open(os.path.join(tmp, "pages", "index", "bom.json"), "w", encoding="utf-8-sig") as f:
+        f.write('{"component": true}')
+    # v1.1.1 回归 fixture：临时/锁文件（半成品内容 + BOM），必须被跳过而不参与校验
+    with open(os.path.join(tmp, "pages", "index", "~$draft.json"), "w", encoding="utf-8-sig") as f:
+        f.write('{"pages": [')
+    with open(os.path.join(tmp, "pages", "index", "index.json.bak"), "w", encoding="utf-8-sig") as f:
+        f.write('{broken')
+    # v1.1.1 回归 fixture：UTF-16 编码的 JSON（应能正确回读，不报编码错误）
+    with open(os.path.join(tmp, "pages", "index", "utf16.json"), "w", encoding="utf-16") as f:
+        f.write('{"ok": 1}')
     print("[selftest] fixture: %s" % tmp)
     class A: pass
     la = A(); la.project = tmp; la.rounds = 1; la.dry = True; la.out = None; la.auto_level = "low"
@@ -1284,6 +1338,11 @@ def cmd_selftest(args):
               "PAV-U-001", "PAV-S-002", "PAV-UI-001", "PAV-UI-002", "PAV-UI-003"}
     miss = expect - codes_dry
     assert not miss, "扫描器漏检: %s" % miss
+    # v1.1.1 回归断言：BOM 文件不得报假红线；临时/锁文件不得进入扫描范围
+    assert "PAV-F-001" not in codes_dry, "BOM 文件被误报为 JSON 语法错误（假红线未修复）"
+    junk_hits = [i for i in sense_dry.get("issues", [])
+                 if "~$" in i["file"] or i["file"].endswith((".bak", ".tmp"))]
+    assert not junk_hits, "临时/备份文件未被跳过: %s" % junk_hits
     # 第二步：十轮深度优化（中风险自动级别），验证功能补齐 + UI 占位补齐 + 修复回归
     oa = A(); oa.project = tmp; oa.rounds = 3; oa.auto_level = "medium"
     cmd_optimize(oa)
@@ -1302,7 +1361,7 @@ def cmd_selftest(args):
     history = load_json(os.path.join(tmp, ".pav", "history.json"), [])
     assert len(history) >= 2 and all("score" in h for h in history), "质量分历史未记录"
     assert os.path.exists(os.path.join(tmp, ".pav", "十轮优化报告.md")), "优化总报告未生成"
-    print("[selftest] ✅ 10 类问题检出 + 功能/UI 自动补齐 + 回归证据匹配 + 质量分趋势 + 优化报告 全部通过")
+    print("[selftest] ✅ 10 类问题检出 + BOM/临时文件/UTF-16 假红线回归 + 功能/UI 自动补齐 + 回归证据匹配 + 质量分趋势 + 优化报告 全部通过")
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
 
